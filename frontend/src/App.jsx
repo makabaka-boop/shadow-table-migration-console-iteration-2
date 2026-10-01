@@ -23,7 +23,7 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = data.error?.message || response.statusText || '请求失败';
-    throw Object.assign(new Error(message), { status: response.status, data });
+    throw Object.assign(new Error(message), { status: response.statusCode, data });
   }
   return data;
 }
@@ -137,15 +137,58 @@ function DataTable({ title, rows, empty }) {
   );
 }
 
+function versionKindLabel(version) {
+  return version.kind === 'restore'
+    ? `恢复（来自 #${version.source_version_id}）`
+    : '字段迁移';
+}
+
+function DiffSummary({ diff }) {
+  if (!diff) return null;
+  return (
+    <div className="diff-summary">
+      <span className={diff.added_count ? 'diff-badge add' : 'diff-badge'}>候选新增 {diff.added_count ?? diff.added?.length ?? 0}</span>
+      <span className={diff.removed_count ? 'diff-badge remove' : 'diff-badge'}>候选移除 {diff.removed_count ?? diff.removed?.length ?? 0}</span>
+      <span className={diff.changed_count ? 'diff-badge change' : 'diff-badge'}>字段变化 {diff.changed_count ?? diff.changed?.length ?? 0}</span>
+      {diff.truncated && <span className="diff-note">差异较多，仅展示前 200 项</span>}
+    </div>
+  );
+}
+
+function DiffTable({ diff }) {
+  const changed = diff?.changed || [];
+  if (!changed.length) return null;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr><th>id</th><th>变化字段</th><th>当前正式表</th><th>候选（恢复后）</th></tr>
+        </thead>
+        <tbody>
+          {changed.map((item) => (
+            <tr key={item.id}>
+              <td>{item.id}</td>
+              <td>{item.columns.join(', ')}</td>
+              <td><code>{JSON.stringify(item.current)}</code></td>
+              <td><code>{JSON.stringify(item.candidate)}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState(null);
   const [mappings, setMappings] = useState(initialMappings);
   const [preview, setPreview] = useState(null);
+  const [restorePreview, setRestorePreview] = useState(null);
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
   const [historyRows, setHistoryRows] = useState([]);
   const [selectedVersion, setSelectedVersion] = useState('');
-  const [faults, setFaults] = useState({ preview_copy: false, commit_switch: false });
+  const [faults, setFaults] = useState({ preview_copy: false, commit_switch: false, restore_switch: false });
   const [newLegacy, setNewLegacy] = useState({ legacy_id: '', code: '', raw_name: '', note: '' });
 
   const refresh = async () => setState(await api('/api/state'));
@@ -167,6 +210,13 @@ export default function App() {
     if (state && selectedVersion === '' && latestVersion) setSelectedVersion(String(latestVersion));
   }, [state, selectedVersion, latestVersion]);
 
+  // Drop restore preview whenever the chosen version changes.
+  useEffect(() => {
+    if (restorePreview && String(restorePreview.source.version_id) !== String(selectedVersion)) {
+      setRestorePreview(null);
+    }
+  }, [selectedVersion, restorePreview]);
+
   const runPreview = async () => {
     setBusy(true);
     setMessage(null);
@@ -177,8 +227,11 @@ export default function App() {
       });
       setPreview(result);
       await refresh();
-      if (result.ok) setMessage({ type: 'success', text: `预演通过，源表修订号 ${result.source_revision}` });
-      else setMessage({ type: 'error', text: '预演发现约束或映射失败，未改变正式表' });
+      if (result.ok) {
+        setMessage({ type: 'success', text: `预演通过，源表修订号 ${result.source_revision}，绑定正式表代际 ${result.records_generation}` });
+      } else {
+        setMessage({ type: 'error', text: '预演发现约束或映射失败，未改变正式表' });
+      }
     } catch (error) {
       setMessage({ type: 'error', text: error.message });
     } finally {
@@ -193,15 +246,80 @@ export default function App() {
     try {
       const result = await api('/api/migrations/commit', {
         method: 'POST',
-        body: JSON.stringify({ preview_id: preview.preview_id, source_revision: preview.source_revision }),
+        body: JSON.stringify({
+          preview_id: preview.preview_id,
+          source_revision: preview.source_revision,
+          records_generation: preview.records_generation,
+        }),
       });
-      setMessage({ type: 'success', text: `提交成功：迁移 #${result.migration_id}，保留旧版 #${result.old_version.version_id}` });
+      setMessage({
+        type: 'success',
+        text: `提交成功：迁移 #${result.migration_id}，代际 ${result.base_generation} → ${result.new_generation}，保留旧版 #${result.old_version.version_id}`,
+      });
       setPreview(null);
       await refresh();
     } catch (error) {
       if (error.status === 409 || error.status === 404) {
         setMessage({ type: 'error', text: `${error.message}。请重新预演后再提交。` });
         setPreview(null);
+      } else {
+        setMessage({ type: 'error', text: error.message });
+      }
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runRestorePreview = async () => {
+    if (!selectedVersion) return;
+    setBusy(true);
+    setMessage(null);
+    setRestorePreview(null);
+    try {
+      const result = await api('/api/restores/preview', {
+        method: 'POST',
+        body: JSON.stringify({ version_id: Number(selectedVersion) }),
+      });
+      setRestorePreview(result);
+      await refresh();
+      const diff = result.diff;
+      setMessage({
+        type: 'success',
+        text: `恢复预演通过：候选来自历史版本 #${result.source.version_id}（其代际 ${result.source.generation}），${result.row_count} 行；当前正式表代际 ${result.records_generation}，尚未切换。`,
+      });
+      if (diff.added_count + diff.removed_count + diff.changed_count === 0) {
+        setMessage((prev) => ({ ...prev, text: `${prev.text} 候选与当前正式表内容一致，确认仍会推进代际并封存当前表。` }));
+      }
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runRestoreCommit = async () => {
+    if (!restorePreview?.preview_id) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api('/api/restores/commit', {
+        method: 'POST',
+        body: JSON.stringify({
+          preview_id: restorePreview.preview_id,
+          records_generation: restorePreview.records_generation,
+        }),
+      });
+      setMessage({
+        type: 'success',
+        text: `恢复成功：代际 ${result.base_generation} → ${result.new_generation}，恢复来源 #${result.source_version_id}，恢复前的正式表已封存为 #${result.archived_version.version_id}（${result.archived_version.row_count} 行）`,
+      });
+      setRestorePreview(null);
+      await refresh();
+    } catch (error) {
+      if (error.status === 409 || error.status === 404) {
+        setMessage({ type: 'error', text: `${error.message}。请重新进行恢复预演。` });
+        setRestorePreview(null);
       } else {
         setMessage({ type: 'error', text: error.message });
       }
@@ -249,6 +367,7 @@ export default function App() {
     try {
       await api('/api/admin/reset', { method: 'POST' });
       setPreview(null);
+      setRestorePreview(null);
       setSelectedVersion('');
       setHistoryRows([]);
       await refresh();
@@ -261,14 +380,21 @@ export default function App() {
 
   if (!state) return <main className="app"><p>正在加载...</p></main>;
 
+  const selectedMeta = state.history.find(
+    (version) => String(version.version_id) === String(selectedVersion),
+  );
+
   return (
     <main className="app">
       <header>
         <div>
-          <h1>SQLite 旧记录影子表迁移</h1>
-          <p>有限字段映射：复制、trim、十进制整数解析、常量</p>
+          <h1>SQLite 旧记录影子表迁移 / 历史版本恢复</h1>
+          <p>有限字段映射：复制、trim、十进制整数解析、常量；历史版本只读，可预演恢复</p>
         </div>
-        <div className="revision">源表修订号 <strong>{state.revision}</strong></div>
+        <div className="badges">
+          <div className="revision">源表修订号 <strong>{state.revision}</strong></div>
+          <div className="revision generation">正式表代际 <strong>{state.records_generation}</strong></div>
+        </div>
       </header>
 
       {message && <div className={`banner ${message.type}`}>{message.text}</div>}
@@ -279,7 +405,7 @@ export default function App() {
           <div className="actions">
             <button disabled={busy} onClick={runPreview}>复制到影子表并预演</button>
             <button className="primary" disabled={busy || !preview?.preview_id} onClick={runCommit}>
-              携带修订号提交
+              携带修订号与代际提交
             </button>
           </div>
         </div>
@@ -289,9 +415,11 @@ export default function App() {
             <strong>{preview.ok ? '预演通过' : '预演失败'}</strong>
             <span>preview_id: {preview.preview_id || '未保留'}</span>
             <span>依据 source_revision: {preview.source_revision}</span>
+            <span>绑定正式表代际: {preview.records_generation}</span>
             <span>读取行数: {preview.row_count}</span>
           </div>
         )}
+        <p className="hint">提交以预演所见的源表修订号和正式表代际裁决；期间发生迁移或恢复都会使旧预演失效。</p>
       </section>
 
       <FailureTable failures={preview?.failures} />
@@ -315,29 +443,73 @@ export default function App() {
           <h2>故障注入 / 测试</h2>
           <div className="faults">
             <button onClick={() => toggleFault('preview_copy')}>{faults.preview_copy ? '关闭' : '开启'} 复制后中断</button>
-            <button onClick={() => toggleFault('commit_switch')}>{faults.commit_switch ? '关闭' : '开启'} 切换前中断</button>
+            <button onClick={() => toggleFault('commit_switch')}>{faults.commit_switch ? '关闭' : '开启'} 迁移切换前中断</button>
+            <button onClick={() => toggleFault('restore_switch')}>{faults.restore_switch ? '关闭' : '开启'} 恢复切换前中断</button>
             <button onClick={reset}>重置数据库</button>
           </div>
-          <p className="hint">影子表：{state.shadow_tables.length ? state.shadow_tables.join(', ') : '无'}</p>
+          <p className="hint">影子/候选表：{state.shadow_tables.length ? state.shadow_tables.join(', ') : '无'}</p>
         </div>
       </section>
 
       <DataTable title="旧表 legacy_records" rows={state.legacy} empty="暂无旧数据" />
-      <DataTable title="正式表 records" rows={state.records} empty="尚未迁移；首次提交后生成正式表" />
+      <DataTable
+        title={`正式表 records（代际 ${state.records_generation}）`}
+        rows={state.records}
+        empty="尚未迁移；首次提交后生成正式表"
+      />
 
       <section className="panel">
-        <h2>只读历史版本</h2>
+        <div className="panel-title">
+          <h2>只读历史版本（当前正式表代际 {state.records_generation}）</h2>
+          <div className="actions">
+            <button
+              disabled={busy || !selectedVersion}
+              onClick={runRestorePreview}
+              title="从该版本生成候选正式表并核对差异，不改写任何记录"
+            >
+              恢复预演所选版本
+            </button>
+            <button
+              className="primary"
+              disabled={busy || !restorePreview?.preview_id}
+              onClick={runRestoreCommit}
+            >
+              确认恢复（封存当前表并切换）
+            </button>
+          </div>
+        </div>
         {state.history.length === 0 ? <p>尚无保留版本。</p> : (
           <>
             <select value={selectedVersion} onChange={(event) => setSelectedVersion(event.target.value)}>
               {state.history.map((version) => (
                 <option key={version.version_id} value={version.version_id}>
-                  版本 #{version.version_id} / 迁移 {version.migration_id} / 源修订 {version.source_revision} / {version.row_count} 行
+                  {`版本 #${version.version_id} / ${versionKindLabel(version)} / 内容代际 ${version.generation} / ${version.row_count} 行${version.locked ? ' · 已封存只读' : ''}`}
                 </option>
               ))}
             </select>
-            <DataTable title={`历史版本 #${selectedVersion} 内容`} rows={historyRows} empty="该版本为空" />
+            {selectedMeta && (
+              <p className="hint">
+                {`所选：版本 #${selectedMeta.version_id}（${versionKindLabel(selectedMeta)}），封存的是代际 ${selectedMeta.generation} 的正式表，共 ${selectedMeta.row_count} 行。`}
+              </p>
+            )}
+            <DataTable title={`历史版本 #${selectedVersion} 内容`} rows={historyRows} empty="该版本为空（首次迁移前无正式表）" />
           </>
+        )}
+
+        {restorePreview && (
+          <div className="preview restore-preview">
+            <strong>恢复预演（未切换）</strong>
+            <span>恢复来源版本: #{restorePreview.source.version_id}（{restorePreview.source.kind === 'restore' ? '恢复产物' : '迁移产物'}，内容代际 {restorePreview.source.generation}）</span>
+            <span>预演所见当前代际: {restorePreview.records_generation}</span>
+            <span>候选行数: {restorePreview.row_count}</span>
+            <DiffSummary diff={restorePreview.diff} />
+            <DiffTable diff={restorePreview.diff} />
+            <DataTable title="候选正式表内容" rows={restorePreview.candidate_rows} empty="候选表为空" />
+            <p className="hint">
+              确认时在同一 SQLite 事务内：封存当前正式表为新的历史版本 → 切换候选表为 records → 正式表代际 +1。
+              预演后若代际变化，确认将被拒绝且本预演作废，需要重新预演。
+            </p>
+          </div>
         )}
       </section>
     </main>

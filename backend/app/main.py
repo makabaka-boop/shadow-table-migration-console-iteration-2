@@ -10,7 +10,17 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import CURRENT_TABLE, HISTORY_TABLE, LEGACY_TABLE, ServiceError, db_session, get_revision, init_db
+from .db import (
+    CURRENT_TABLE,
+    HISTORY_TABLE,
+    LEGACY_TABLE,
+    RESTORE_PREVIEW_META_TABLE,
+    ServiceError,
+    db_session,
+    get_records_generation,
+    get_revision,
+    init_db,
+)
 from .migration import (
     HISTORY_ROWS_TABLE,
     CommitPayload,
@@ -19,8 +29,14 @@ from .migration import (
     commit_preview,
     create_preview,
 )
+from .restore import (
+    RestoreCommitPayload,
+    RestorePreviewPayload,
+    commit_restore,
+    create_restore_preview,
+)
 
-ALLOWED_FAULTS = {"preview_copy", "commit_switch"}
+ALLOWED_FAULTS = {"preview_copy", "commit_switch", "restore_switch"}
 
 
 @asynccontextmanager
@@ -29,7 +45,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="SQLite Shadow Migration", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="SQLite Shadow Migration", version="2.0.0", lifespan=lifespan)
 
 
 class FaultPayload(BaseModel):
@@ -103,7 +119,11 @@ def insert_legacy(payload: LegacyRowPayload) -> dict[str, object]:
 def list_records() -> dict[str, object]:
     with db_session() as conn:
         rows = [dict(row) for row in conn.execute(f"SELECT * FROM {CURRENT_TABLE} ORDER BY id")]
-        return {"rows": rows, "count": len(rows)}
+        return {
+            "generation": get_records_generation(conn),
+            "rows": rows,
+            "count": len(rows),
+        }
 
 
 @app.post("/api/migrations/preview")
@@ -116,6 +136,16 @@ def migration_commit(payload: CommitPayload) -> dict[str, object]:
     return commit_preview(payload)
 
 
+@app.post("/api/restores/preview")
+def preview_restore(payload: RestorePreviewPayload) -> dict[str, object]:
+    return create_restore_preview(payload)
+
+
+@app.post("/api/restores/commit")
+def restore_commit(payload: RestoreCommitPayload) -> dict[str, object]:
+    return commit_restore(payload)
+
+
 @app.get("/api/history")
 def history() -> dict[str, object]:
     with db_session() as conn:
@@ -123,15 +153,17 @@ def history() -> dict[str, object]:
             dict(row)
             for row in conn.execute(
                 f"""
-                SELECT v.version_id, v.migration_id, v.replaced_table, v.source_revision,
-                       m.committed_revision, v.row_count, v.created_at
+                SELECT v.version_id, v.kind, v.migration_id, v.restore_id,
+                       v.replaced_table, v.source_revision, v.source_version_id,
+                       v.generation, v.row_count, v.locked, v.created_at,
+                       m.committed_revision
                   FROM {HISTORY_TABLE} v
-                  JOIN migrations m ON m.migration_id = v.migration_id
+             LEFT JOIN migrations m ON m.migration_id = v.migration_id
                  ORDER BY v.version_id
                 """
             )
         ]
-        return {"versions": versions}
+        return {"records_generation": get_records_generation(conn), "versions": versions}
 
 
 @app.get("/api/history/{version_id}/rows")
@@ -181,21 +213,40 @@ def set_fault(payload: FaultPayload) -> dict[str, object]:
 
 def _state_payload(conn: sqlite3.Connection) -> dict[str, object]:
     legacy_rows = [dict(row) for row in conn.execute(f"SELECT * FROM {LEGACY_TABLE} ORDER BY legacy_id")]
-    current_rows = [dict(row) for row in conn.execute(f"SELECT * FROM {CURRENT_TABLE} ORDER BY id")]
+    formal_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (CURRENT_TABLE,),
+    ).fetchone()
+    current_rows = (
+        [dict(row) for row in conn.execute(f"SELECT * FROM {CURRENT_TABLE} ORDER BY id")]
+        if formal_exists
+        else []
+    )
     versions = [dict(row) for row in conn.execute(f"SELECT * FROM {HISTORY_TABLE} ORDER BY version_id")]
     previews = [dict(row) for row in conn.execute("SELECT * FROM migration_preview_meta")]
+    restore_previews = [dict(row) for row in conn.execute(f"SELECT * FROM {RESTORE_PREVIEW_META_TABLE}")]
     shadows = [
         row[0]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'migration_shadow_%'"
+            """
+            SELECT name FROM sqlite_master
+             WHERE type='table'
+               AND (name LIKE 'migration_shadow_%'
+                    OR name LIKE 'records_pending_%'
+                    OR name LIKE 'records_restore_candidate_%')
+             ORDER BY name
+            """
         )
     ]
     return {
         "revision": get_revision(conn),
+        "records_generation": get_records_generation(conn),
         "legacy": legacy_rows,
         "records": current_rows,
+        "formal_table_exists": formal_exists is not None,
         "history": versions,
         "previews": previews,
+        "restore_previews": restore_previews,
         "shadow_tables": shadows,
     }
 

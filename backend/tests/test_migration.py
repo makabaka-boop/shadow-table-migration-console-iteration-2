@@ -116,9 +116,13 @@ def test_switch_failure_rolls_back_without_half_new_table(client):
     assert state['history'] == [
         {
             'version_id': 1,
+            'kind': 'migration',
             'migration_id': 1,
+            'restore_id': None,
             'replaced_table': 'records',
             'source_revision': 3,
+            'source_version_id': None,
+            'generation': 0,
             'row_count': 0,
             'locked': 1,
             'created_at': state['history'][0]['created_at'],

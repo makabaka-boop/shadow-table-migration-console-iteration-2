@@ -17,8 +17,19 @@ INT64_MAX = 2**63 - 1
 LEGACY_TABLE = "legacy_records"
 CURRENT_TABLE = "records"
 HISTORY_TABLE = "record_versions"
+HISTORY_ROWS_TABLE = "record_version_rows"
 MIGRATIONS_TABLE = "migrations"
+RESTORES_TABLE = "restores"
 PREVIEW_META_TABLE = "migration_preview_meta"
+RESTORE_PREVIEW_META_TABLE = "restore_preview_meta"
+
+# Monotonic revision scopes.  The legacy revision advances on every edit of
+# the source table.  The formal-table generation advances once per transaction
+# that replaces `records`; previews of either kind bind to the generation they
+# saw so that an old preview can never overwrite a newer formal table.
+LEGACY_REVISION_SCOPE = "legacy_records"
+RECORDS_GENERATION_SCOPE = "records"
+INITIAL_RECORDS_GENERATION = 0
 
 TARGET_COLUMNS = ("id", "code", "label")
 
@@ -65,41 +76,59 @@ def db_session(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
 def init_db(db_path: str | None = None, *, reset: bool = False) -> None:
     with db_session(db_path) as conn:
         if reset:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            dynamic_tables = [
-                row[0]
-                for row in conn.execute(
-                    """
-                    SELECT name FROM sqlite_master
-                     WHERE type='table'
-                       AND (name LIKE 'migration_shadow_%' OR name LIKE 'records_pending_%')
-                    """
-                )
-            ]
-            for table_name in dynamic_tables:
-                conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-            for table_name in (
-                "legacy_records",
-                "records",
-                "record_versions",
-                "record_version_rows",
-                "migrations",
-                "migration_preview_meta",
-                "revision_meta",
-                "fault_injection_state",
-            ):
-                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-            for trigger_name in (
-                "legacy_records_revision_ai",
-                "legacy_records_revision_au",
-                "legacy_records_revision_ad",
-                "record_version_rows_readonly_insert",
-                "record_version_rows_readonly_update",
-                "record_version_rows_readonly_delete",
-                "record_versions_readonly_update",
-                "record_versions_readonly_delete",
-            ):
-                conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            # Explicit test-only wipe.  The history/restore tables reference
+            # each other, so disabling foreign keys while dropping keeps the
+            # teardown order-independent; the subsequent schema creation turns
+            # enforcement back on.  foreign_keys must be toggled outside a
+            # transaction (SQLite ignores the pragma inside one).
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("BEGIN")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                dynamic_tables = [
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                         WHERE type='table'
+                           AND (name LIKE 'migration_shadow_%'
+                                OR name LIKE 'records_pending_%'
+                                OR name LIKE 'records_restore_candidate_%')
+                        """
+                    )
+                ]
+                for table_name in dynamic_tables:
+                    conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+                for table_name in (
+                    "legacy_records",
+                    "records",
+                    "record_versions",
+                    "record_version_rows",
+                    "migrations",
+                    "restores",
+                    "migration_preview_meta",
+                    "restore_preview_meta",
+                    "revision_meta",
+                    "fault_injection_state",
+                ):
+                    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                for trigger_name in (
+                    "legacy_records_revision_ai",
+                    "legacy_records_revision_au",
+                    "legacy_records_revision_ad",
+                    "record_version_rows_readonly_insert",
+                    "record_version_rows_readonly_update",
+                    "record_version_rows_readonly_delete",
+                    "record_versions_readonly_update",
+                    "record_versions_readonly_delete",
+                ):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
 
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -129,22 +158,43 @@ def init_db(db_path: str | None = None, *, reset: bool = False) -> None:
                 preview_id TEXT NOT NULL UNIQUE,
                 source_revision INTEGER NOT NULL,
                 committed_revision INTEGER NOT NULL,
+                base_generation INTEGER NOT NULL,
+                new_generation INTEGER NOT NULL,
                 row_count INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
+            CREATE TABLE IF NOT EXISTS {RESTORES_TABLE} (
+                restore_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                preview_id TEXT NOT NULL UNIQUE,
+                source_version_id INTEGER NOT NULL,
+                base_generation INTEGER NOT NULL,
+                new_generation INTEGER NOT NULL,
+                archived_version_id INTEGER,
+                row_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                FOREIGN KEY(source_version_id) REFERENCES {HISTORY_TABLE}(version_id),
+                FOREIGN KEY(archived_version_id) REFERENCES {HISTORY_TABLE}(version_id)
+            );
+
             CREATE TABLE IF NOT EXISTS {HISTORY_TABLE} (
-                version_id INTEGER PRIMARY KEY,
-                migration_id INTEGER NOT NULL UNIQUE,
+                version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('migration', 'restore')),
+                migration_id INTEGER UNIQUE,
+                restore_id INTEGER UNIQUE,
                 replaced_table TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 source_revision INTEGER NOT NULL,
+                source_version_id INTEGER,
+                generation INTEGER NOT NULL,
                 row_count INTEGER NOT NULL,
                 locked INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY(migration_id) REFERENCES {MIGRATIONS_TABLE}(migration_id)
+                FOREIGN KEY(migration_id) REFERENCES {MIGRATIONS_TABLE}(migration_id),
+                FOREIGN KEY(restore_id) REFERENCES {RESTORES_TABLE}(restore_id),
+                FOREIGN KEY(source_version_id) REFERENCES {HISTORY_TABLE}(version_id)
             );
 
-            CREATE TABLE IF NOT EXISTS record_version_rows (
+            CREATE TABLE IF NOT EXISTS {HISTORY_ROWS_TABLE} (
                 version_id INTEGER NOT NULL,
                 id INTEGER NOT NULL,
                 code TEXT NOT NULL,
@@ -193,9 +243,20 @@ def init_db(db_path: str | None = None, *, reset: bool = False) -> None:
             CREATE TABLE IF NOT EXISTS {PREVIEW_META_TABLE} (
                 preview_id TEXT PRIMARY KEY,
                 source_revision INTEGER NOT NULL,
+                records_generation INTEGER NOT NULL,
                 row_count INTEGER NOT NULL,
                 mappings_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS {RESTORE_PREVIEW_META_TABLE} (
+                preview_id TEXT PRIMARY KEY,
+                source_version_id INTEGER NOT NULL,
+                records_generation INTEGER NOT NULL,
+                row_count INTEGER NOT NULL,
+                diff_summary_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                FOREIGN KEY(source_version_id) REFERENCES {HISTORY_TABLE}(version_id)
             );
 
             CREATE TABLE IF NOT EXISTS fault_injection_state (
@@ -206,7 +267,12 @@ def init_db(db_path: str | None = None, *, reset: bool = False) -> None:
         )
 
         conn.execute(
-            "INSERT OR IGNORE INTO revision_meta(scope, revision) VALUES ('legacy_records', 0)"
+            f"INSERT OR IGNORE INTO revision_meta(scope, revision) VALUES (?, ?)",
+            (LEGACY_REVISION_SCOPE, 0),
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO revision_meta(scope, revision) VALUES (?, ?)",
+            (RECORDS_GENERATION_SCOPE, INITIAL_RECORDS_GENERATION),
         )
         conn.executescript(
             """
@@ -244,8 +310,55 @@ def init_db(db_path: str | None = None, *, reset: bool = False) -> None:
             )
 
 
-def get_revision(conn: sqlite3.Connection) -> int:
+def _get_revision(conn: sqlite3.Connection, scope: str) -> int:
     row = conn.execute(
-        "SELECT revision FROM revision_meta WHERE scope='legacy_records'"
+        "SELECT revision FROM revision_meta WHERE scope=?",
+        (scope,),
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def get_revision(conn: sqlite3.Connection) -> int:
+    return _get_revision(conn, LEGACY_REVISION_SCOPE)
+
+
+def get_records_generation(conn: sqlite3.Connection) -> int:
+    return _get_revision(conn, RECORDS_GENERATION_SCOPE)
+
+
+def advance_records_generation(conn: sqlite3.Connection) -> int:
+    """Advance the formal-table generation inside the open write transaction."""
+    conn.execute(
+        """
+        UPDATE revision_meta
+           SET revision = revision + 1
+         WHERE scope = ?
+        """,
+        (RECORDS_GENERATION_SCOPE,),
+    )
+    return get_records_generation(conn)
+
+
+def expire_all_previews(conn: sqlite3.Connection) -> None:
+    """Invalidate every outstanding preview inside an open write transaction.
+
+    Once the formal table generation advances, any migration or restore preview
+    created earlier is stale: its scratch tables and metadata must disappear so
+    an old client request can never be replayed against the new formal table.
+    """
+    conn.execute(f"DELETE FROM {PREVIEW_META_TABLE}")
+    conn.execute(f"DELETE FROM {RESTORE_PREVIEW_META_TABLE}")
+    leftover_tables = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT name FROM sqlite_master
+             WHERE type='table'
+               AND (name LIKE 'migration_shadow_%'
+                    OR name LIKE 'records_pending_%'
+                    OR name LIKE 'records_restore_candidate_%')
+            """
+        )
+    ]
+    for table_name in leftover_tables:
+        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .db import (
     CURRENT_TABLE,
+    HISTORY_ROWS_TABLE,
     HISTORY_TABLE,
     INT64_MAX,
     INT64_MIN,
@@ -18,11 +19,13 @@ from .db import (
     PREVIEW_META_TABLE,
     TARGET_COLUMNS,
     ServiceError,
+    advance_records_generation,
     db_session,
+    expire_all_previews,
+    get_records_generation,
     get_revision,
 )
 
-HISTORY_ROWS_TABLE = "record_version_rows"
 LEGACY_COLUMNS = {"legacy_id", "code", "raw_name", "note"}
 DECIMAL_INT_RE = re.compile(r"^-?[0-9]+$")
 MAX_TEXT_LENGTH = 1_000
@@ -68,6 +71,9 @@ class CommitPayload(BaseModel):
 
     preview_id: str = Field(..., min_length=32, max_length=64, pattern="^[0-9a-f]+$")
     source_revision: int
+    # Optional so older clients keep working; the generation stored server side
+    # by the preview remains the authority that is always re-checked.
+    records_generation: int | None = None
 
 
 def _mapping_source(mapping: dict[str, Any]) -> str:
@@ -165,6 +171,7 @@ def create_preview(mappings: MappingsPayload, db_path: str | None = None) -> dic
         try:
             conn.execute("BEGIN IMMEDIATE")
             source_revision = get_revision(conn)
+            records_generation = get_records_generation(conn)
             _create_shadow(conn, shadow_name)
 
             source_rows = conn.execute(
@@ -230,6 +237,7 @@ def create_preview(mappings: MappingsPayload, db_path: str | None = None) -> dic
                 return {
                     "preview_id": None,
                     "source_revision": source_revision,
+                    "records_generation": records_generation,
                     "ok": False,
                     "row_count": len(source_rows),
                     "mappings": mapping_data,
@@ -239,15 +247,16 @@ def create_preview(mappings: MappingsPayload, db_path: str | None = None) -> dic
             conn.execute(
                 f"""
                 INSERT INTO {PREVIEW_META_TABLE}
-                    (preview_id, source_revision, row_count, mappings_json)
-                VALUES (?, ?, ?, ?)
+                    (preview_id, source_revision, records_generation, row_count, mappings_json)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (preview_id, source_revision, len(source_rows), json.dumps(mapping_data)),
+                (preview_id, source_revision, records_generation, len(source_rows), json.dumps(mapping_data)),
             )
             conn.commit()
             return {
                 "preview_id": preview_id,
                 "source_revision": source_revision,
+                "records_generation": records_generation,
                 "ok": True,
                 "row_count": len(source_rows),
                 "mappings": mapping_data,
@@ -362,9 +371,10 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
                     "source table changed after preview; recalculate and preview again",
                 )
 
+            current_generation = get_records_generation(conn)
             preview = conn.execute(
                 f"""
-                SELECT preview_id, source_revision, row_count, mappings_json
+                SELECT preview_id, source_revision, records_generation, row_count, mappings_json
                   FROM {PREVIEW_META_TABLE}
                  WHERE preview_id=?
                 """,
@@ -378,6 +388,18 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
                     "stale_preview",
                     "commit revision does not match the revision used by this preview",
                 )
+            if payload.records_generation is not None and payload.records_generation != current_generation:
+                raise ServiceError(
+                    409,
+                    "stale_preview",
+                    "formal table generation changed after preview; preview again",
+                )
+            if preview["records_generation"] != current_generation:
+                raise ServiceError(
+                    409,
+                    "stale_preview",
+                    "formal table generation changed after this preview; a restore or newer commit landed; preview again",
+                )
 
             shadow_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -390,26 +412,41 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
             if shadow_count != preview["row_count"]:
                 raise ServiceError(409, "shadow_changed", "shadow table changed; preview again")
 
+            new_generation = current_generation + 1
             cur = conn.execute(
-                f"INSERT INTO {MIGRATIONS_TABLE}"
-                "(preview_id, source_revision, committed_revision, row_count) VALUES (?, ?, ?, ?)",
+                f"""
+                INSERT INTO {MIGRATIONS_TABLE}
+                    (preview_id, source_revision, committed_revision,
+                     base_generation, new_generation, row_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
                 (
                     payload.preview_id,
                     preview["source_revision"],
                     current_revision,
+                    current_generation,
+                    new_generation,
                     preview["row_count"],
                 ),
             )
             migration_id = int(cur.lastrowid)
             old_count = conn.execute(f"SELECT COUNT(*) FROM {CURRENT_TABLE}").fetchone()[0]
+            # Version ids are their own AUTOINCREMENT lineage: a restore also
+            # creates versions, so a version id must never be forced to equal a
+            # migration id.
             conn.execute(
                 f"""
                 INSERT INTO {HISTORY_TABLE}
-                    (version_id, migration_id, replaced_table, source_revision, row_count, locked)
-                VALUES (?, ?, ?, ?, ?, 0)
+                    (kind, migration_id, restore_id, replaced_table,
+                     source_revision, source_version_id, generation, row_count, locked)
+                VALUES ('migration', ?, NULL, ?, ?, NULL, ?, ?, 0)
                 """,
-                (migration_id, migration_id, CURRENT_TABLE, preview["source_revision"], old_count),
+                (migration_id, CURRENT_TABLE, preview["source_revision"],
+                 current_generation, old_count),
             )
+            archived_version_id = conn.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
 
             conn.execute(
                 f"""
@@ -418,17 +455,17 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
                 SELECT ?, id, code, label, legacy_id
                   FROM {CURRENT_TABLE}
                 """,
-                (migration_id,),
+                (archived_version_id,),
             )
             copied_old_count = conn.execute(
                 f"SELECT COUNT(*) FROM {HISTORY_ROWS_TABLE} WHERE version_id=?",
-                (migration_id,),
+                (archived_version_id,),
             ).fetchone()[0]
             if copied_old_count != old_count:
                 raise RuntimeError("injected/copy mismatch while preserving old version")
             conn.execute(
                 f"UPDATE {HISTORY_TABLE} SET locked=1 WHERE version_id=?",
-                (migration_id,),
+                (archived_version_id,),
             )
 
             conn.execute(f"DROP TABLE IF EXISTS {pending_name}")
@@ -461,8 +498,12 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
             # exact previous table.
             conn.execute(f"DROP TABLE {CURRENT_TABLE}")
             conn.execute(f"ALTER TABLE {pending_name} RENAME TO {CURRENT_TABLE}")
-            conn.execute(f"DROP TABLE {shadow_name}")
-            conn.execute(f"DELETE FROM {PREVIEW_META_TABLE} WHERE preview_id=?", (payload.preview_id,))
+            advanced_generation = advance_records_generation(conn)
+            if advanced_generation != new_generation:
+                raise RuntimeError("formal table generation mismatch after switch")
+            # Every surviving preview saw the previous generation and could
+            # otherwise be replayed against the new formal table.
+            expire_all_previews(conn)
             conn.commit()
 
             return {
@@ -471,9 +512,11 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
                 "preview_id": payload.preview_id,
                 "source_revision": preview["source_revision"],
                 "committed_revision": current_revision,
+                "base_generation": current_generation,
+                "new_generation": new_generation,
                 "row_count": pending_count,
                 "old_version": {
-                    "version_id": migration_id,
+                    "version_id": archived_version_id,
                     "row_count": old_count,
                 },
             }
@@ -487,7 +530,7 @@ def commit_preview(payload: CommitPayload, db_path: str | None = None) -> dict[s
             conn.rollback()
             _discard_failed_preview(conn, payload.preview_id, pending_name)
             raise ServiceError(422, "constraint_failed", f"new-table constraint failed: {exc}") from exc
-        except Exception as exc:
+        except Exception:
             conn.rollback()
             _discard_failed_preview(conn, payload.preview_id, pending_name)
             raise
