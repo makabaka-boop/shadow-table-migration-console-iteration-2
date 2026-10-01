@@ -116,14 +116,21 @@ def test_switch_failure_rolls_back_without_half_new_table(client):
     assert state['history'] == [
         {
             'version_id': 1,
+            'op_id': 1,
+            'kind': 'migration',
             'migration_id': 1,
+            'source_version_id': None,
             'replaced_table': 'records',
             'source_revision': 3,
+            'committed_revision': 3,
+            'base_generation': 0,
+            'new_generation': 1,
             'row_count': 0,
             'locked': 1,
             'created_at': state['history'][0]['created_at'],
         }
     ]
+    assert state['formal_generation'] == 1
 
 
 def test_stale_preview_is_rejected_after_interleaved_legacy_write(client):
